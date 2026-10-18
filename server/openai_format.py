@@ -1,8 +1,9 @@
 """Translate between OpenAI's chat-completions shapes and our DeepSeek client.
 
-DeepSeek's protocol has no system/role channel — just a single `prompt` string.
-So we flatten the OpenAI `messages` array into one prompt, and wrap DeepSeek's
-text output back into OpenAI response/stream objects.
+DeepSeek's web protocol has no system/role channel — just a single `prompt` string.
+So we flatten the OpenAI `messages` array and tool definitions into one prompt,
+and wrap DeepSeek's text output back into standard OpenAI response/stream objects,
+with native support for `reasoning_content` (DeepSeek-R1 / Hermes).
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from typing import Iterable, List
+from typing import Any, Iterable, List, Optional
 
 from .schemas import ChatMessage
 
@@ -30,20 +31,69 @@ def _text_of(content) -> str:
     return "\n".join(parts)
 
 
-def messages_to_prompt(messages: List[ChatMessage]) -> str:
-    """Flatten a chat history into a single prompt DeepSeek can answer.
+def messages_to_prompt(
+    messages: List[ChatMessage],
+    tools: Optional[List[dict]] = None,
+) -> str:
+    """Flatten a chat history and tool definitions into a single prompt DeepSeek can answer.
 
-    A lone user message is sent verbatim. Multi-turn / system-prompted
-    conversations are serialised with role labels and a trailing 'Assistant:'
-    cue so the model continues in the right voice.
+    - Supports Hermes / OpenAI tool schemas and tool calls
+    - Retains tool responses and assistant tool_calls across multi-turn loops
+    - Preserves system and user turns cleanly
     """
-    if len(messages) == 1 and messages[0].role == "user":
+    lines = []
+
+    # If tools are defined, inject a Hermes-compatible tool definition header
+    if tools:
+        tools_json = json.dumps(tools, indent=2, ensure_ascii=False)
+        tools_system = (
+            "You have access to the following tools:\n"
+            f"<tools>\n{tools_json}\n</tools>\n\n"
+            "To use a tool, output a tool call block formatted as:\n"
+            "<tool_call>\n"
+            '{"name": "<function_name>", "arguments": <args_dict>}\n'
+            "</tool_call>"
+        )
+        lines.append(f"System: {tools_system}")
+
+    for m in messages:
+        role = m.role.lower()
+        content = _text_of(m.content)
+
+        if role == "system":
+            if content:
+                lines.append(f"System: {content}")
+        elif role == "user":
+            lines.append(f"User: {content}")
+        elif role == "assistant":
+            parts = []
+            if getattr(m, "reasoning_content", None):
+                parts.append(f"<think>\n{m.reasoning_content}\n</think>")
+            if content:
+                parts.append(content)
+            if getattr(m, "tool_calls", None):
+                for tc in m.tool_calls:
+                    fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                    name = fn.get("name", "")
+                    args = fn.get("arguments", "{}")
+                    try:
+                        args_obj = json.loads(args) if isinstance(args, str) else args
+                    except Exception:
+                        args_obj = args
+                    call_str = json.dumps({"name": name, "arguments": args_obj}, ensure_ascii=False)
+                    parts.append(f"<tool_call>\n{call_str}\n</tool_call>")
+            asst_text = "\n".join(parts)
+            lines.append(f"Assistant: {asst_text}")
+        elif role in ("tool", "function"):
+            name = getattr(m, "name", None) or getattr(m, "tool_call_id", None) or "tool"
+            lines.append(f"Tool ({name}): {content}")
+        else:
+            label = _ROLE_LABELS.get(role, role.capitalize())
+            lines.append(f"{label}: {content}")
+
+    if len(messages) == 1 and messages[0].role == "user" and not tools:
         return _text_of(messages[0].content)
 
-    lines = []
-    for m in messages:
-        label = _ROLE_LABELS.get(m.role, m.role.capitalize())
-        lines.append(f"{label}: {_text_of(m.content)}")
     lines.append("Assistant:")
     return "\n\n".join(lines)
 
@@ -61,14 +111,24 @@ def _est_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-def completion_response(model: str, content: str, prompt: str,
-                        conversation_id: str = None) -> dict:
+def completion_response(
+    model: str,
+    content: str,
+    prompt: str,
+    conversation_id: str = None,
+    reasoning: str = None,
+) -> dict:
     """A full (non-streaming) OpenAI chat.completion object.
 
-    `conversation_id` is an extra top-level field (outside OpenAI's schema) you
-    send back to resume the conversation.
+    Includes `reasoning_content` if reasoning/thinking output is present.
     """
-    pt, ct = _est_tokens(prompt), _est_tokens(content)
+    pt = _est_tokens(prompt)
+    ct = _est_tokens(content) + (_est_tokens(reasoning) if reasoning else 0)
+
+    msg = {"role": "assistant", "content": content}
+    if reasoning:
+        msg["reasoning_content"] = reasoning
+
     return {
         "id": _id(),
         "object": "chat.completion",
@@ -78,7 +138,7 @@ def completion_response(model: str, content: str, prompt: str,
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": content},
+                "message": msg,
                 "finish_reason": "stop",
             }
         ],
@@ -90,11 +150,11 @@ def completion_response(model: str, content: str, prompt: str,
     }
 
 
-def stream_chunks(model: str, stream: Iterable[str]) -> Iterable[str]:
+def stream_chunks(model: str, stream: Iterable[Any]) -> Iterable[str]:
     """Yield OpenAI SSE lines (`data: {...}\\n\\n`) for a streamed completion.
 
-    `stream` is the client's stream object; after it's consumed we read its
-    `.conversation_id` and attach it to the final chunk.
+    Separates reasoning tokens (`delta.reasoning_content`) from answer tokens
+    (`delta.content`) for compatibility with Hermes, Open WebUI, and standard LRMs.
     """
     cid, created = _id(), _now()
 
@@ -112,9 +172,15 @@ def stream_chunks(model: str, stream: Iterable[str]) -> Iterable[str]:
 
     # First frame announces the assistant role.
     yield frame({"role": "assistant", "content": ""})
+
     for d in stream:
-        if d:
-            yield frame({"content": d})
+        if not d:
+            continue
+        if getattr(d, "is_thinking", False):
+            yield frame({"reasoning_content": str(d)})
+        else:
+            yield frame({"content": str(d)})
+
     conversation_id = getattr(stream, "conversation_id", None)
     yield frame({}, finish="stop", extra={"conversation_id": conversation_id})
     yield "data: [DONE]\n\n"

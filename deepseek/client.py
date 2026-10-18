@@ -22,6 +22,7 @@ session (see `deepseek.auth`). For each message it:
 from __future__ import annotations
 
 import json
+import re
 import threading
 from dataclasses import dataclass
 from typing import Iterator, Optional
@@ -65,6 +66,7 @@ class Reply:
 
     text: str
     conversation_id: str
+    reasoning: Optional[str] = None
 
     def __str__(self) -> str:  # so print(reply) shows the text
         return self.text
@@ -176,11 +178,19 @@ class DeepSeekClient:
         thinking: bool = False,
         search: bool = False,
     ) -> Reply:
-        """Return the complete reply (`.text`) plus its `.conversation_id`."""
+        """Return the complete reply (`.text`) plus its `.conversation_id` and optional `.reasoning`."""
         s = self.stream(prompt, conversation_id=conversation_id,
                         model=model, thinking=thinking, search=search)
-        text = "".join(s)
-        return Reply(text=text, conversation_id=s.conversation_id)
+        content_parts = []
+        reasoning_parts = []
+        for chunk in s:
+            if getattr(chunk, "is_thinking", False):
+                reasoning_parts.append(str(chunk))
+            else:
+                content_parts.append(str(chunk))
+        text = "".join(content_parts)
+        reasoning = "".join(reasoning_parts) if reasoning_parts else None
+        return Reply(text=text, conversation_id=s.conversation_id, reasoning=reasoning)
 
     def close(self) -> None:
         self._http.close()
@@ -232,61 +242,114 @@ class _Stream:
         return _encode_cid(self._session_id, self._message_id)
 
 
-def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[str]:
+class StreamChunk(str):
+    """A string chunk that carries an `is_thinking` boolean attribute."""
+
+    is_thinking: bool = False
+
+    def __new__(cls, content: str, is_thinking: bool = False):
+        obj = super().__new__(cls, content)
+        obj.is_thinking = is_thinking
+        return obj
+
+
+def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[StreamChunk]:
     """Turn DeepSeek's SSE completion stream into reply-text deltas.
 
-    The stream sends an initial snapshot frame whose `v` is the full response
-    object (with `fragments[].content`), then a series of append frames:
-      * {"p":"response/fragments/-1/content","o":"APPEND","v":" what"}  (sets path)
-      * {"v":"'s"}                                                       (appends to it)
-    We track the active append path and emit only RESPONSE-fragment text.
-
-    If `meta` is given, the assistant's `message_id` is recorded into it (used to
-    build the resumable conversation_id). The exact field location can vary, so
-    we look in a few plausible spots defensively.
+    Handles both THINKING (reasoning) and RESPONSE fragments accurately.
+    Preserves active fragment pointers across metadata patches (token counts,
+    elapsed seconds, status updates), preventing dropped chunks and truncated
+    responses.
     """
-    active_path: Optional[str] = None
-    emitted_initial = False
+    fragment_types: dict[int, str] = {}
+    emitted_lengths: dict[int, int] = {}
+    active_frag_idx: Optional[int] = None
+    active_prop: Optional[str] = None
+    buffer = ""
 
     for line in lines:
-        if not line or not line.startswith("data:"):
+        if not line:
             continue
-        payload = line[len("data:"):].strip()
+        if isinstance(line, bytes):
+            line = line.decode("utf-8", errors="replace")
+
+        line = line.strip()
+        if not line:
+            continue
+
+        if line.startswith("data:"):
+            payload = line[len("data:"):].strip()
+        else:
+            payload = line
+
         if not payload or payload == "[DONE]":
             continue
+
         try:
             obj = json.loads(payload)
+            buffer = ""
         except json.JSONDecodeError:
-            continue
+            buffer += payload
+            try:
+                obj = json.loads(buffer)
+                buffer = ""
+            except json.JSONDecodeError:
+                continue
 
         v = obj.get("v")
 
-        # Snapshot frame: full response object.
+        # Snapshot frame: contains full response object or updated fragments
         if isinstance(v, dict) and "response" in v:
+            resp_obj = v["response"]
             if meta is not None:
                 _capture_message_id(meta, v)
-            for frag in v["response"].get("fragments", []):
-                if frag.get("type") == "RESPONSE" and frag.get("content"):
-                    active_path = "response/fragments/-1/content"
-                    if not emitted_initial:
-                        emitted_initial = True
-                        yield frag["content"]
+
+            fragments = resp_obj.get("fragments", [])
+            for idx, frag in enumerate(fragments):
+                frag_type = frag.get("type", "RESPONSE")
+                fragment_types[idx] = frag_type
+                content = frag.get("content", "")
+                if isinstance(content, str) and content:
+                    prev_len = emitted_lengths.get(idx, 0)
+                    if len(content) > prev_len:
+                        delta = content[prev_len:]
+                        emitted_lengths[idx] = len(content)
+                        active_frag_idx = idx
+                        active_prop = "content"
+                        yield StreamChunk(delta, is_thinking=(frag_type == "THINKING"))
             continue
 
-        # Path-setting append frame.
+        # Patch frame with path "p"
         if "p" in obj:
-            active_path = obj["p"]
-            if meta is not None and active_path.endswith("message_id") \
-                    and isinstance(v, int):
+            p = str(obj["p"])
+            if meta is not None and (p.endswith("message_id") or p.endswith("/id")) and isinstance(v, int):
                 meta["message_id"] = v
-            if obj.get("o") == "APPEND" and isinstance(v, str) \
-                    and active_path.endswith("content"):
-                yield v
+
+            frag_match = re.match(r"^response/fragments/(-?\d+)(?:/(.*))?$", p)
+            if frag_match:
+                raw_idx = int(frag_match.group(1))
+                if raw_idx < 0:
+                    raw_idx = max(fragment_types.keys(), default=0)
+                prop = frag_match.group(2) or ""
+
+                if prop == "type" and isinstance(v, str):
+                    fragment_types[raw_idx] = v
+
+                if prop == "content" or prop.endswith("/content") or prop == "":
+                    active_frag_idx = raw_idx
+                    active_prop = "content"
+
+                    if isinstance(v, str) and v:
+                        frag_type = fragment_types.get(active_frag_idx, "RESPONSE")
+                        emitted_lengths[active_frag_idx] = emitted_lengths.get(active_frag_idx, 0) + len(v)
+                        yield StreamChunk(v, is_thinking=(frag_type == "THINKING"))
             continue
 
-        # Bare append to the current path.
-        if isinstance(v, str) and active_path and active_path.endswith("content"):
-            yield v
+        # Bare append frame: {"v": "..."} without "p"
+        if isinstance(v, str) and v and active_prop == "content" and active_frag_idx is not None:
+            frag_type = fragment_types.get(active_frag_idx, "RESPONSE")
+            emitted_lengths[active_frag_idx] = emitted_lengths.get(active_frag_idx, 0) + len(v)
+            yield StreamChunk(v, is_thinking=(frag_type == "THINKING"))
 
 
 def _capture_message_id(meta: dict, snapshot: dict) -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
 from pydantic import BaseModel
 
@@ -14,6 +14,13 @@ class ChatMessage(BaseModel):
     # content is a plain string, or a list of parts (OpenAI vision-style). We only
     # read text parts; non-text parts are ignored.
     content: Union[str, List[dict], None] = None
+    name: Optional[str] = None
+    tool_calls: Optional[List[dict]] = None
+    tool_call_id: Optional[str] = None
+    reasoning_content: Optional[str] = None
+
+    class Config:
+        extra = "allow"
 
 
 class ChatCompletionRequest(BaseModel):
@@ -26,8 +33,19 @@ class ChatCompletionRequest(BaseModel):
     # pass these via extra_body: `thinking` (DeepThink), `search` (web).
     thinking: bool = False
     search: bool = False
-    # Accepted for compatibility but not all are forwarded to DeepSeek.
+    # Standard OpenAI function/tool definitions
+    tools: Optional[List[dict]] = None
+    tool_choice: Optional[Union[str, dict]] = None
+    # Accepted for compatibility with OpenAI SDK / Hermes
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     max_tokens: Optional[int] = None
     user: Optional[str] = None
+    response_format: Optional[dict] = None
+    stop: Optional[Union[str, List[str]]] = None
+    presence_penalty: Optional[float] = None
+    frequency_penalty: Optional[float] = None
+    stream_options: Optional[dict] = None
+
+    class Config:
+        extra = "allow"

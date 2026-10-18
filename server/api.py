@@ -112,7 +112,7 @@ async def chat_completions(req: ChatCompletionRequest):
     # A thread's model is fixed when it's created, so on resume we ignore `model`
     # (the OpenAI SDK always sends one) and let the existing thread's model stand.
     model_type = None if req.conversation_id else resolve_model_type(req.model)
-    prompt = messages_to_prompt(req.messages)
+    prompt = messages_to_prompt(req.messages, tools=req.tools)
 
     try:
         # Off the event loop: get_client() uses Playwright's sync API, which
@@ -125,13 +125,24 @@ async def chat_completions(req: ChatCompletionRequest):
 
     if req.stream:
         def gen():
-            stream = client.stream(
-                prompt, conversation_id=req.conversation_id,
-                model=model_type, thinking=req.thinking, search=req.search,
-            )
-            yield from stream_chunks(req.model, stream)
+            try:
+                stream = client.stream(
+                    prompt, conversation_id=req.conversation_id,
+                    model=model_type, thinking=req.thinking, search=req.search,
+                )
+                yield from stream_chunks(req.model, stream)
+            except Exception as e:
+                err_obj = {"error": {"message": str(e), "type": "stream_error"}}
+                yield f"data: {json.dumps(err_obj, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
 
-        return StreamingResponse(gen(), media_type="text/event-stream")
+        headers = {
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+        return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
 
     try:
         reply = await run_in_threadpool(
@@ -141,4 +152,8 @@ async def chat_completions(req: ChatCompletionRequest):
     except Exception as e:
         return _error(f"DeepSeek request failed: {e}")
 
-    return completion_response(req.model, reply.text, prompt, reply.conversation_id)
+    return completion_response(
+        req.model, reply.text, prompt,
+        conversation_id=reply.conversation_id,
+        reasoning=reply.reasoning,
+    )
