@@ -262,7 +262,9 @@ def stream_chunks(model: str, stream: Iterable[Any]) -> Iterable[str]:
     """Yield OpenAI SSE lines (`data: {...}\\n\\n`) for a streamed completion.
 
     - Separates reasoning tokens (`delta.reasoning_content`) from answer tokens.
-    - Transparently parses DeepSeek DSML tool calls and streams standard `tool_calls` deltas.
+    - Buffers all content text and only emits it after the full response is
+      complete, so that DSML / <tool_call> blocks can be detected and translated
+      into proper OpenAI `tool_calls` deltas instead of leaking as raw text.
     """
     cid, created = _id(), _now()
 
@@ -281,9 +283,9 @@ def stream_chunks(model: str, stream: Iterable[Any]) -> Iterable[str]:
     # First frame announces the assistant role.
     yield frame({"role": "assistant", "content": ""})
 
-    buffer = ""
-    in_tool_call = False
-    dsml_start_re = re.compile(r"<[|\s\uff5c]*DSML", re.IGNORECASE)
+    # Collect all content chunks, emitting reasoning immediately but buffering
+    # regular content so we can detect tool calls at the end.
+    content_buffer = []
 
     for d in stream:
         if not d:
@@ -291,43 +293,42 @@ def stream_chunks(model: str, stream: Iterable[Any]) -> Iterable[str]:
         if getattr(d, "is_thinking", False):
             yield frame({"reasoning_content": str(d)})
             continue
-
-        text_chunk = str(d)
-
-        if not in_tool_call:
-            test_buf = buffer + text_chunk
-            if dsml_start_re.search(test_buf) or "<tool_call>" in test_buf:
-                in_tool_call = True
-                buffer = test_buf
-            else:
-                yield frame({"content": text_chunk})
-        else:
-            buffer += text_chunk
+        content_buffer.append(str(d))
 
     conversation_id = getattr(stream, "conversation_id", None)
+    full_text = "".join(content_buffer)
 
-    if in_tool_call and buffer:
-        clean_text, tool_calls = parse_tool_calls(buffer)
+    # Check if the accumulated text contains tool calls
+    clean_text, tool_calls = parse_tool_calls(full_text)
+
+    if tool_calls:
+        # Emit any leading text before the tool calls
         if clean_text:
             yield frame({"content": clean_text})
-        if tool_calls:
-            for idx, tc in enumerate(tool_calls):
-                yield frame({
-                    "tool_calls": [
-                        {
-                            "index": idx,
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["function"]["name"],
-                                "arguments": tc["function"]["arguments"],
-                            },
-                        }
-                    ]
-                })
-            yield frame({}, finish="tool_calls", extra={"conversation_id": conversation_id})
-            yield "data: [DONE]\n\n"
-            return
+        # Emit each tool call as a proper delta
+        for idx, tc in enumerate(tool_calls):
+            yield frame({
+                "tool_calls": [
+                    {
+                        "index": idx,
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["function"]["name"],
+                            "arguments": tc["function"]["arguments"],
+                        },
+                    }
+                ]
+            })
+        yield frame({}, finish="tool_calls", extra={"conversation_id": conversation_id})
+        yield "data: [DONE]\n\n"
+        return
+
+    # No tool calls — emit all content chunks as normal streaming deltas
+    for chunk_text in content_buffer:
+        if chunk_text:
+            yield frame({"content": chunk_text})
 
     yield frame({}, finish="stop", extra={"conversation_id": conversation_id})
     yield "data: [DONE]\n\n"
+
