@@ -106,20 +106,28 @@ def _safe_evaluate(page, js: str):
     try:
         return page.evaluate(js)
     except Exception as e:
-        msg = str(e)
-        if "Execution context was destroyed" in msg or "navigation" in msg.lower():
+        msg = str(e).lower()
+        if (
+            "execution context was destroyed" in msg
+            or "navigation" in msg
+            or "cannot find context" in msg
+            or "target closed" in msg
+        ):
             return None
         raise
 
 
-def _capture_from_context(context, page) -> Optional[Session]:
-    """Read token + cookies + UA off a logged-in page, or None if not signed in."""
-    token = _safe_evaluate(page, _READ_TOKEN_JS)
-    if not token:
-        return None
-    cookies = {c["name"]: c["value"] for c in context.cookies()}
-    ua = _safe_evaluate(page, "() => navigator.userAgent") or ""
-    return Session(token=token, cookies=cookies, user_agent=ua, captured_at=time.time())
+def _capture_from_context(context, page, retries: int = 5) -> Optional[Session]:
+    """Read token + cookies + UA off a logged-in page, with retries for post-login redirects."""
+    for attempt in range(retries):
+        token = _safe_evaluate(page, _READ_TOKEN_JS)
+        if token:
+            cookies = {c["name"]: c["value"] for c in context.cookies()}
+            ua = _safe_evaluate(page, "() => navigator.userAgent") or ""
+            return Session(token=token, cookies=cookies, user_agent=ua, captured_at=time.time())
+        if attempt < retries - 1:
+            page.wait_for_timeout(1000)
+    return None
 
 
 def _wait_for_token(page, timeout: float) -> Optional[str]:
@@ -182,7 +190,7 @@ def login(
         existing = None
         if not assume_logged_out:
             _safe_goto(page, CHAT_URL)
-            existing = page.evaluate(_READ_TOKEN_JS)
+            existing = _safe_evaluate(page, _READ_TOKEN_JS)
 
         if not existing:
             _safe_goto(page, SIGNIN_URL)
