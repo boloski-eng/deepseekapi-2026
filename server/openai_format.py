@@ -3,12 +3,14 @@
 DeepSeek's web protocol has no system/role channel — just a single `prompt` string.
 So we flatten the OpenAI `messages` array and tool definitions into one prompt,
 and wrap DeepSeek's text output back into standard OpenAI response/stream objects,
-with native support for `reasoning_content` (DeepSeek-R1 / Hermes).
+with native support for `reasoning_content` and DeepSeek DSML tool calling.
 """
 
 from __future__ import annotations
 
+import html
 import json
+import re
 import time
 import uuid
 from typing import Any, Iterable, List, Optional
@@ -31,6 +33,98 @@ def _text_of(content) -> str:
     return "\n".join(parts)
 
 
+def parse_tool_calls(text: str) -> tuple[str, list[dict]]:
+    """Parse DeepSeek DSML tool calls and <tool_call> blocks into OpenAI tool_calls.
+
+    Handles:
+      < | | DSML | | calls>
+      < | | DSML | | invoke name="...">
+      < | | DSML | | parameter name="..." string="true">...</ | | DSML | | parameter>
+      </ | | DSML | | invoke>
+      </ | | DSML | | calls>
+
+    As well as fullwidth pipe (<｜DSML｜calls>) and standard <tool_call> JSON blocks.
+    """
+    if not text:
+        return text, []
+
+    tool_calls = []
+    clean_text = text
+
+    # Pattern for DSML calls blocks:
+    # Delimiters can be: < | | DSML | | calls>, <｜DSML｜calls>, <|DSML|calls>, etc.
+    dsml_block_re = re.compile(
+        r"<[|\s\uff5c]*DSML[|\s\uff5c]*(?:calls|tool_calls)>([\s\S]*?)(?:</[|\s\uff5c]*DSML[|\s\uff5c]*(?:calls|tool_calls)>|$)",
+        re.IGNORECASE,
+    )
+
+    invoke_re = re.compile(
+        r"<[|\s\uff5c]*DSML[|\s\uff5c]*invoke\s+name=[\"']([^\"']+)[\"']>([\s\S]*?)(?:</[|\s\uff5c]*DSML[|\s\uff5c]*invoke>|$)",
+        re.IGNORECASE,
+    )
+
+    param_re = re.compile(
+        r"<[|\s\uff5c]*DSML[|\s\uff5c]*parameter\s+name=[\"']([^\"']+)[\"'](?:\s+string=[\"']([^\"']+)[\"'])?>([\s\S]*?)</[|\s\uff5c]*DSML[|\s\uff5c]*parameter>",
+        re.IGNORECASE,
+    )
+
+    for block_match in dsml_block_re.finditer(text):
+        block_content = block_match.group(1)
+        for inv_match in invoke_re.finditer(block_content):
+            tool_name = inv_match.group(1).strip()
+            inv_body = inv_match.group(2)
+            args = {}
+            for p_match in param_re.finditer(inv_body):
+                p_name = p_match.group(1).strip()
+                p_is_str = (p_match.group(2) or "true").lower() == "true"
+                raw_val = p_match.group(3).strip()
+                p_val = html.unescape(raw_val)
+                if not p_is_str:
+                    try:
+                        p_val = json.loads(p_val)
+                    except Exception:
+                        pass
+                args[p_name] = p_val
+
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": json.dumps(args, ensure_ascii=False) if args else "{}",
+                },
+            })
+
+    # Also handle standard <tool_call> JSON format
+    tool_call_xml_re = re.compile(r"<tool_call>([\s\S]*?)</tool_call>", re.IGNORECASE)
+    for tc_match in tool_call_xml_re.finditer(text):
+        raw_json = tc_match.group(1).strip()
+        try:
+            parsed = json.loads(raw_json)
+            name = parsed.get("name") or parsed.get("tool")
+            args = parsed.get("arguments") or parsed.get("parameters") or {}
+            if name:
+                args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": args_str,
+                    },
+                })
+        except Exception:
+            pass
+
+    if tool_calls:
+        # Strip DSML and tool_call markup from clean_text
+        clean_text = dsml_block_re.sub("", clean_text)
+        clean_text = tool_call_xml_re.sub("", clean_text)
+        clean_text = clean_text.strip()
+
+    return clean_text, tool_calls
+
+
 def messages_to_prompt(
     messages: List[ChatMessage],
     tools: Optional[List[dict]] = None,
@@ -38,21 +132,17 @@ def messages_to_prompt(
     """Flatten a chat history and tool definitions into a single prompt DeepSeek can answer.
 
     - Supports Hermes / OpenAI tool schemas and tool calls
-    - Retains tool responses and assistant tool_calls across multi-turn loops
+    - Reconstructs native DeepSeek DSML tool calls and results across turns
     - Preserves system and user turns cleanly
     """
     lines = []
 
-    # If tools are defined, inject a Hermes-compatible tool definition header
+    # If tools are defined, inject tool definitions
     if tools:
         tools_json = json.dumps(tools, indent=2, ensure_ascii=False)
         tools_system = (
             "You have access to the following tools:\n"
-            f"<tools>\n{tools_json}\n</tools>\n\n"
-            "To use a tool, output a tool call block formatted as:\n"
-            "<tool_call>\n"
-            '{"name": "<function_name>", "arguments": <args_dict>}\n'
-            "</tool_call>"
+            f"<tools>\n{tools_json}\n</tools>"
         )
         lines.append(f"System: {tools_system}")
 
@@ -72,21 +162,30 @@ def messages_to_prompt(
             if content:
                 parts.append(content)
             if getattr(m, "tool_calls", None):
+                parts.append("<｜DSML｜calls>")
                 for tc in m.tool_calls:
                     fn = tc.get("function", {}) if isinstance(tc, dict) else {}
                     name = fn.get("name", "")
-                    args = fn.get("arguments", "{}")
+                    raw_args = fn.get("arguments", "{}")
                     try:
-                        args_obj = json.loads(args) if isinstance(args, str) else args
+                        args_dict = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
                     except Exception:
-                        args_obj = args
-                    call_str = json.dumps({"name": name, "arguments": args_obj}, ensure_ascii=False)
-                    parts.append(f"<tool_call>\n{call_str}\n</tool_call>")
+                        args_dict = {"command": raw_args}
+                    parts.append(f'<｜DSML｜invoke name="{name}">')
+                    if isinstance(args_dict, dict):
+                        for k, v in args_dict.items():
+                            val_str = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+                            is_str = "true" if isinstance(v, str) else "false"
+                            parts.append(f'<｜DSML｜parameter name="{k}" string="{is_str}">{val_str}</｜DSML｜parameter>')
+                    else:
+                        parts.append(f'<｜DSML｜parameter name="command" string="true">{args_dict}</｜DSML｜parameter>')
+                    parts.append("</｜DSML｜invoke>")
+                parts.append("</｜DSML｜calls>")
             asst_text = "\n".join(parts)
             lines.append(f"Assistant: {asst_text}")
         elif role in ("tool", "function"):
             name = getattr(m, "name", None) or getattr(m, "tool_call_id", None) or "tool"
-            lines.append(f"Tool ({name}): {content}")
+            lines.append(f"<｜DSML｜result invoke_name=\"{name}\">\n{content}\n</｜DSML｜result>")
         else:
             label = _ROLE_LABELS.get(role, role.capitalize())
             lines.append(f"{label}: {content}")
@@ -120,14 +219,23 @@ def completion_response(
 ) -> dict:
     """A full (non-streaming) OpenAI chat.completion object.
 
-    Includes `reasoning_content` if reasoning/thinking output is present.
+    Includes parsed `tool_calls` and `reasoning_content` if present.
     """
+    clean_content, tool_calls = parse_tool_calls(content)
+
     pt = _est_tokens(prompt)
     ct = _est_tokens(content) + (_est_tokens(reasoning) if reasoning else 0)
 
-    msg = {"role": "assistant", "content": content}
+    finish_reason = "tool_calls" if tool_calls else "stop"
+
+    msg = {
+        "role": "assistant",
+        "content": clean_content if clean_content else None,
+    }
     if reasoning:
         msg["reasoning_content"] = reasoning
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
 
     return {
         "id": _id(),
@@ -139,7 +247,7 @@ def completion_response(
             {
                 "index": 0,
                 "message": msg,
-                "finish_reason": "stop",
+                "finish_reason": finish_reason,
             }
         ],
         "usage": {
@@ -153,8 +261,8 @@ def completion_response(
 def stream_chunks(model: str, stream: Iterable[Any]) -> Iterable[str]:
     """Yield OpenAI SSE lines (`data: {...}\\n\\n`) for a streamed completion.
 
-    Separates reasoning tokens (`delta.reasoning_content`) from answer tokens
-    (`delta.content`) for compatibility with Hermes, Open WebUI, and standard LRMs.
+    - Separates reasoning tokens (`delta.reasoning_content`) from answer tokens.
+    - Transparently parses DeepSeek DSML tool calls and streams standard `tool_calls` deltas.
     """
     cid, created = _id(), _now()
 
@@ -173,14 +281,53 @@ def stream_chunks(model: str, stream: Iterable[Any]) -> Iterable[str]:
     # First frame announces the assistant role.
     yield frame({"role": "assistant", "content": ""})
 
+    buffer = ""
+    in_tool_call = False
+    dsml_start_re = re.compile(r"<[|\s\uff5c]*DSML", re.IGNORECASE)
+
     for d in stream:
         if not d:
             continue
         if getattr(d, "is_thinking", False):
             yield frame({"reasoning_content": str(d)})
+            continue
+
+        text_chunk = str(d)
+
+        if not in_tool_call:
+            test_buf = buffer + text_chunk
+            if dsml_start_re.search(test_buf) or "<tool_call>" in test_buf:
+                in_tool_call = True
+                buffer = test_buf
+            else:
+                yield frame({"content": text_chunk})
         else:
-            yield frame({"content": str(d)})
+            buffer += text_chunk
 
     conversation_id = getattr(stream, "conversation_id", None)
+
+    if in_tool_call and buffer:
+        clean_text, tool_calls = parse_tool_calls(buffer)
+        if clean_text:
+            yield frame({"content": clean_text})
+        if tool_calls:
+            for idx, tc in enumerate(tool_calls):
+                yield frame({
+                    "tool_calls": [
+                        {
+                            "index": idx,
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc["function"]["name"],
+                                "arguments": tc["function"]["arguments"],
+                            },
+                        }
+                    ]
+                })
+            yield frame({}, finish="tool_calls", extra={"conversation_id": conversation_id})
+            yield "data: [DONE]\n\n"
+            return
+
     yield frame({}, finish="stop", extra={"conversation_id": conversation_id})
     yield "data: [DONE]\n\n"
